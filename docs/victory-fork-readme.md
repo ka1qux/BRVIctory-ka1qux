@@ -422,7 +422,9 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_D3D12_DRED=fault` | on a GPU failure, the faulting address, nearby live allocations, and matching retired copies |
+| `VICTORY_D3D12_DRED=crumbs` | page fault details plus D3D12 breadcrumbs |
+| `VICTORY_D3D12_DRED=1` | page fault details, D3D12 breadcrumbs, and VIctory's per-command markers |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash (release builds too). On AMD's Windows drivers `39f0e9aeb156a61c` never finishes compiling |
 | `VICTORY_TEXTURE_STAGE_MB=192` / `VICTORY_TEXTURE_STAGE_MS=250` | texture memory staged per frame for shaders that pick textures by index, and the time the pass may take (release builds too). Raise them when the queue drains slowly at a low frame rate |

@@ -2386,6 +2386,29 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Addresses and metadata for recently dropped host copies.
+#[cfg(feature = "diagnostics")]
+static RETIRED: Mutex<std::collections::VecDeque<RetiredCopy>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(feature = "diagnostics")]
+struct RetiredCopy {
+    gpu: u64,
+    start: u64,
+    len: u64,
+    freed: u64,
+    used: u64,
+    asks: u64,
+    window: bool,
+}
+
+#[cfg(feature = "diagnostics")]
+impl RetiredCopy {
+    fn offset(&self, va: u64) -> Option<u64> {
+        va.checked_sub(self.gpu).filter(|&offset| offset < self.len)
+    }
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
@@ -2395,6 +2418,23 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if self.gpu != 0 && crate::host::dred_enabled() {
+            const MAX_RETIRED: usize = 1 << 14;
+            let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+            if retired.len() == MAX_RETIRED {
+                retired.pop_front();
+            }
+            retired.push_back(RetiredCopy {
+                gpu: self.gpu,
+                start: self.start,
+                len: self.len,
+                freed: crate::host::now_us(),
+                used: self.used.load(Ordering::Relaxed),
+                asks: self.unsized_asks.load(Ordering::Relaxed),
+                window: self.window,
+            });
+        }
         if let Some(base) = self.marks {
             crate::marks::give_back(base, self.start, self.len);
         }
@@ -6058,7 +6098,45 @@ pub(crate) fn near(va: u64) -> String {
             all.len()
         ));
     }
+    #[cfg(feature = "diagnostics")]
+    if crate::host::dred_enabled() {
+        let retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::host::now_us();
+        let frame = crate::frame::current();
+        for (copy, offset) in retired
+            .iter()
+            .rev()
+            .filter_map(|copy| copy.offset(va).map(|offset| (copy, offset)))
+            .take(8)
+        {
+            let age = now.saturating_sub(copy.freed) as f64 / 1e6;
+            let frames = frame.saturating_sub(copy.used >> 32);
+            text.push_str(&format!(
+                "; a copy retired {age:.1} s earlier: {:#x}+{:#x}, offset {offset:#x} (window {}, {} asks without a length, last used {frames} frames earlier)",
+                copy.start, copy.len, copy.window, copy.asks,
+            ));
+        }
+    }
     text
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn dred_retired_copy_matches_only_addresses_inside_its_range() {
+    let copy = RetiredCopy {
+        gpu: u64::MAX - 3,
+        len: 4,
+        start: 0x2000,
+        freed: 0,
+        used: 0,
+        asks: 0,
+        window: true,
+    };
+    assert_eq!(copy.offset(u64::MAX - 4), None);
+    assert_eq!(copy.offset(u64::MAX - 3), Some(0));
+    assert_eq!(copy.offset(u64::MAX), Some(3));
+    let copy = RetiredCopy { gpu: 0x1000, len: 4, ..copy };
+    assert_eq!(copy.offset(0x1004), None);
 }
 
 /// Whether every update of a copy copies its whole range

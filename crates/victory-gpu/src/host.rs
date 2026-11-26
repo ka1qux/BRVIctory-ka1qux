@@ -747,12 +747,18 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        let dred_mode = dred_mode();
+        if dred_mode != DredMode::Off {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                let breadcrumbs = if dred_mode == DredMode::Fault {
+                    D3D12_DRED_ENABLEMENT_FORCED_OFF
+                } else {
+                    D3D12_DRED_ENABLEMENT_FORCED_ON
+                };
+                dred.SetAutoBreadcrumbsEnablement(breadcrumbs);
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
@@ -1636,13 +1642,51 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
-pub(crate) fn dred_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DredMode {
+    Off,
+    Fault,
+    Breadcrumbs,
+    Full,
+}
+
+impl DredMode {
+    fn from_setting(value: Option<&std::ffi::OsStr>) -> Self {
+        match value {
+            None => Self::Off,
+            Some(value) if value == "fault" => Self::Fault,
+            Some(value) if value == "crumbs" => Self::Breadcrumbs,
+            // Other set values preserve the previous full diagnostic mode.
+            Some(_) => Self::Full,
+        }
+    }
+}
+
+fn dred_mode() -> DredMode {
+    if !cfg!(feature = "diagnostics") {
+        return DredMode::Off;
+    }
+    static MODE: OnceLock<DredMode> = OnceLock::new();
+    *MODE.get_or_init(|| DredMode::from_setting(std::env::var_os("VICTORY_D3D12_DRED").as_deref()))
+}
+
+/// Whether allocation names and fault reporting are enabled.
+pub(crate) fn dred_enabled() -> bool {
+    dred_mode() != DredMode::Off
+}
+
+#[cfg(test)]
+mod dred_tests {
+    use super::DredMode;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn dred_opt_in_levels_preserve_legacy_mode() {
+        assert_eq!(DredMode::from_setting(None), DredMode::Off);
+        assert_eq!(DredMode::from_setting(Some(OsStr::new("fault"))), DredMode::Fault);
+        assert_eq!(DredMode::from_setting(Some(OsStr::new("crumbs"))), DredMode::Breadcrumbs);
+        assert_eq!(DredMode::from_setting(Some(OsStr::new("1"))), DredMode::Full);
+    }
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
@@ -1675,7 +1719,7 @@ fn timing() -> bool {
 fn names_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        dred_on()
+        dred_enabled()
             || (cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_RENDERDOC").is_some())
     })
 }
@@ -7228,6 +7272,9 @@ impl Host {
                 text.push_str(&crate::shadow::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
             }
+            if dred_mode() == DredMode::Fault {
+                return text;
+            }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
@@ -8054,7 +8101,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        if dred_mode() != DredMode::Full {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
