@@ -87,14 +87,60 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// Where in `buffer` it begins (the footprints' offsets count it), and
+    /// the chunk it is a slot of ([`Chunk`]); `data` maps all of `buffer`.
+    base: u64,
+    chunk: Option<Arc<Chunk>>,
 }
 
-/// A staging buffer nothing holds: the buffer and where it is mapped.
-struct Spare(ID3D12Resource, usize);
+/// A staging buffer nothing holds: a buffer of its own and where it is
+/// mapped, or a slot of a chunk and where in it the slot begins.
+enum Spare {
+    Own(ID3D12Resource, usize),
+    Slot(Arc<Chunk>, u64),
+}
 
 // SAFETY: a D3D12 buffer and its mapping, touched by nobody while it is
 // spare.
 unsafe impl Send for Spare {}
+
+/// An upload buffer cut into staging slots of one size, which go back to
+/// the spare ones one by one ([`chunk_bytes`]).
+struct Chunk {
+    buffer: ID3D12Resource,
+    data: usize,
+    /// Of its `slots`, those spare now (changed under [`SPARE`]'s lock).
+    spare: std::sync::atomic::AtomicU32,
+    slots: u32,
+}
+
+/// The size of the upload buffers staging slots are cut from
+/// (`VICTORY_STAGING_CHUNK_MB`; unset or 0 uses individual buffers).
+/// The cutscene's longest frames (2 to 4 s) made 1,200 to
+/// 4,500 staging buffers each, a `CreateCommittedResource` apiece on the
+/// recording thread with the graphics kernel waiting in most of them (some
+/// 0.8 ms each); from chunks, one in many slots does.
+fn chunk_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |n| n.min(256))
+            << 20
+    })
+}
+
+/// Where a staging buffer lies: the buffer, its mapping (of the whole
+/// buffer), its pool size (0: not pooled), where in the buffer it begins,
+/// and the chunk it is a slot of.
+struct Memory {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    pooled: u64,
+    base: u64,
+    chunk: Option<Arc<Chunk>>,
+}
 
 /// Spare staging buffers by size (a power of two), and their bytes in all.
 static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
@@ -116,29 +162,72 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// dip. Buffers of up to 8 MiB are now kept by size and used again,
 /// zeroed as a new one is (levels not there yet must read as zeros).
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
-fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<Memory> {
+    use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let own = |(buffer, data): (ID3D12Resource, *mut u8), pooled: u64| Memory { buffer, data, pooled, base: 0, chunk: None };
     let size = total.max(64 << 10).next_power_of_two();
     if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
-        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+        return host.upload_buffer(total).map(|made| own(made, 0));
     }
     let spare = {
         let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = all.0.get_mut(&size).and_then(Vec::pop);
-        if taken.is_some() {
+        if let Some(taken) = &taken {
             all.1 -= size;
+            if let Spare::Slot(chunk, _) = taken {
+                chunk.spare.fetch_sub(1, Relaxed);
+            }
         }
         taken
     };
-    if let Some(Spare(buffer, data)) = spare {
-        SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: the buffer's own mapping, `size` bytes, which nothing
-        // else holds.
-        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
-        return Some((buffer, data as *mut u8, size));
+    match spare {
+        Some(Spare::Own(buffer, data)) => {
+            SPARE_STATS[0].fetch_add(1, Relaxed);
+            // SAFETY: the buffer's own mapping, `size` bytes, which nothing
+            // else holds.
+            unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
+            return Some(own((buffer, data as *mut u8), size));
+        }
+        Some(Spare::Slot(chunk, base)) => {
+            SPARE_STATS[0].fetch_add(1, Relaxed);
+            // SAFETY: the slot's `size` bytes of the chunk's mapping, which
+            // nothing else holds.
+            unsafe { std::ptr::write_bytes((chunk.data as *mut u8).add(base as usize), 0, total as usize) };
+            return Some(Memory {
+                buffer: chunk.buffer.clone(),
+                data: chunk.data as *mut u8,
+                pooled: size,
+                base,
+                chunk: Some(chunk),
+            });
+        }
+        None => {}
     }
-    SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+    SPARE_STATS[1].fetch_add(1, Relaxed);
+    let bytes = chunk_bytes();
+    if bytes < 2 * size {
+        return host.upload_buffer(size).map(|made| own(made, size));
+    }
+    // A new chunk (all zeros, as a new buffer is): its first slot is this
+    // one's, the others spare.
+    let Some((buffer, data)) = host.upload_buffer(bytes) else {
+        return host.upload_buffer(size).map(|made| own(made, size));
+    };
+    crate::host::name(&buffer, || format!("staging slots of {} KiB", size >> 10));
+    let slots = (bytes / size) as u32;
+    let chunk = Arc::new(Chunk {
+        buffer: buffer.clone(),
+        data: data as usize,
+        spare: std::sync::atomic::AtomicU32::new(slots - 1),
+        slots,
+    });
+    {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        all.1 += u64::from(slots - 1) * size;
+        all.0.entry(size).or_default().extend((1..slots).map(|i| Spare::Slot(chunk.clone(), u64::from(i) * size)));
+    }
+    Some(Memory { buffer, data, pooled: size, base: 0, chunk: Some(chunk) })
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -596,9 +685,28 @@ impl Drop for Staging {
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if let Some(chunk) = &self.chunk {
                 all.1 += self.pooled;
-                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+                all.0.entry(self.pooled).or_default().push(Spare::Slot(chunk.clone(), self.base));
+                // A chunk with every slot spare goes while more than the
+                // most kept spare is (released below, outside the lock).
+                let spare = chunk.spare.fetch_add(1, Relaxed) + 1;
+                if spare == chunk.slots && all.1 > SPARE_MOST.0 {
+                    let gone: Vec<Spare> = {
+                        let list = all.0.entry(self.pooled).or_default();
+                        let (gone, kept) = std::mem::take(list)
+                            .into_iter()
+                            .partition(|s| matches!(s, Spare::Slot(c, _) if Arc::ptr_eq(c, chunk)));
+                        *list = kept;
+                        gone
+                    };
+                    all.1 -= gone.len() as u64 * self.pooled;
+                    drop(all);
+                    drop(gone);
+                }
+            } else if all.1 + self.pooled <= SPARE_MOST.0 {
+                all.1 += self.pooled;
+                all.0.entry(self.pooled).or_default().push(Spare::Own(self.buffer.clone(), self.data as usize));
             }
         }
     }
@@ -1772,7 +1880,11 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
+    let Memory { buffer, data, pooled, base, chunk } = staging_buffer(host, total)?;
+    // A slot of a chunk: its subresources lie past where it begins.
+    for footprint in &mut footprints {
+        footprint.Offset += base;
+    }
     // Where each part lies in title memory (the order of `part`: mips of a
     // slice, slice after slice), for refreshes of written pages alone.
     let spans = (!on_demand && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
@@ -1783,12 +1895,14 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
                 .collect::<Option<Vec<_>>>()
         })
         .flatten();
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    if chunk.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -1815,6 +1929,8 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        base,
+        chunk,
     });
     map.insert(resource as usize, s.clone());
     add_to_address_index(&s);
@@ -2158,6 +2274,36 @@ mod title_memory_tests {
             let byte = *(mapped as *const u8);
             readback.Unmap(0, None);
             byte
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a D3D12 adapter and VICTORY_STAGING_CHUNK_MB=32"]
+    fn two_textures_share_one_upload_buffer_without_aliasing() {
+        use windows::core::Interface;
+
+        let host = crate::host::host().expect("a host D3D12 device");
+        let (first, first_data, first_size, first_texture) = make_test_texture();
+        let (second, second_data, second_size, second_texture) = make_test_texture();
+        let first_staging = super::staging(first, first_texture, 0).expect("first upload slot");
+        let second_staging = super::staging(second, second_texture, 0).expect("second upload slot");
+
+        assert_eq!(first_staging.buffer.as_raw(), second_staging.buffer.as_raw());
+        assert_ne!(first_staging.footprints[0].Offset, second_staging.footprints[0].Offset);
+        // SAFETY: each pointer maps its own live title texture.
+        unsafe {
+            first_data.write_bytes(0x31, first_size);
+            second_data.write_bytes(0x62, second_size);
+        }
+        assert_eq!(read_texel_byte(host, first, first_texture, false), 0x31);
+        assert_eq!(read_texel_byte(host, second, second_texture, false), 0x62);
+        drop((first_staging, second_staging));
+
+        for resource in [first, second] {
+            let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+                resource, 0x10,
+            );
+            assert_eq!(release(resource), 0);
         }
     }
 
